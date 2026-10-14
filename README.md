@@ -34,3 +34,7 @@ producer-consumer synchronization system
 
 - example: 
     ./broker --seconds=10 --producers=3 --consumers=3 --topics=2
+
+- notes:
+    - `--producers` and `--consumers` must each be between `topics` and `2 * topics`, otherwise the program exits with an error.
+    - `--prio-weights=H,M,L` sets the random weights for high/medium/low priority messages (default `1,3,6`).

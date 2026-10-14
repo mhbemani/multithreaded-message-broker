@@ -391,6 +391,15 @@ static int consumer_pop_personal(Consumer *c, Message *out){
 // ------------------------------------------------------------
 typedef struct ConsumerArg { Broker *b; Consumer *c; } ConsumerArg;
 
+// load_ms / load_by_prio are shared between dispatchers and the consumer: always access under c_mtx
+static long long consumer_relevant_load(Consumer *c, int prio){
+    long long sum = 0;
+    pthread_mutex_lock(&c->c_mtx);
+    for (int p = 0; p <= prio; p++) sum += c->load_by_prio[p];
+    pthread_mutex_unlock(&c->c_mtx);
+    return sum;
+}
+
 static void *consumer_thread(void *arg){
     ConsumerArg *ca = (ConsumerArg*)arg; 
     Broker *b = ca->b; 
@@ -407,8 +416,6 @@ static void *consumer_thread(void *arg){
 
             long actual = (long)(end - start);
             long long total_latency = end - m.created_ms;
-            long long queue_latency = start - m.assigned_ms;
-            long long system_latency = m.assigned_ms - m.created_ms;
 
             atomic_fetch_add(&b->prio_count[m.priority % 3], 1);
             atomic_fetch_add(&b->prio_total_ms[m.priority % 3], actual);
@@ -417,6 +424,7 @@ static void *consumer_thread(void *arg){
             atomic_fetch_add(&c->done_count, 1);
             
             // CHANGED: Update priority-specific load
+            pthread_mutex_lock(&c->c_mtx);
             if (c->load_by_prio[m.priority] >= m.est_ms) 
                 c->load_by_prio[m.priority] -= m.est_ms; 
             else 
@@ -426,6 +434,7 @@ static void *consumer_thread(void *arg){
                 c->load_ms -= m.est_ms; 
             else 
                 c->load_ms = 0;
+            pthread_mutex_unlock(&c->c_mtx);
                 
             printf("[Consumer %s] done msg=%d prio=%d est=%ldms actual=%ldms total_latency=%lldms from topic=%s\n", 
                    c->name, m.id, m.priority, m.est_ms, actual, total_latency, m.topic);
@@ -444,7 +453,6 @@ static void *producer_thread(void *arg){
     Broker *b = pa->b; 
     int pid = pa->id; 
     Topic **my_topics = pa->topics; 
-    int my_topic_count = pa->topic_count;
     free(pa);
 
     while (!atomic_load(&b->stop)){
@@ -506,12 +514,8 @@ static void *dispatcher_thread(void *arg){
                 if (!registered) continue;
                 
                 // CHANGED: Calculate priority-aware load for prediction
-                long long relevant_load = 0;
-                for (int p = 0; p <= m.priority; p++) {
-                    relevant_load += c->load_by_prio[p];
-                }
+                long long relevant_load = consumer_relevant_load(c, m.priority);
                 
-                long long predicted_finish = now + relevant_load + m.est_ms;
                 long long time_until_deadline = (m.deadline_ms > 0) ? (m.deadline_ms - now) : LLONG_MAX;
                 
                 // Score considers both load and deadline urgency
@@ -535,10 +539,7 @@ static void *dispatcher_thread(void *arg){
             Consumer *chosen = &b->consumers[best];
             
             // CHANGED: Calculate priority-aware load for deadline checking
-            long long relevant_load = 0;
-            for (int p = 0; p <= m.priority; p++) {
-                relevant_load += chosen->load_by_prio[p];
-            }
+            long long relevant_load = consumer_relevant_load(chosen, m.priority);
             long long predicted_finish = now + relevant_load + m.est_ms;
             // if it can not get done on time -> reject
             if (m.deadline_ms > 0 && predicted_finish > m.deadline_ms){
@@ -558,16 +559,16 @@ static void *dispatcher_thread(void *arg){
             if (atomic_load(&b->stop)) { pthread_mutex_unlock(&chosen->c_mtx); continue; }
             
             q_push_back_nolock(&chosen->personal_q, m);
-            pthread_cond_signal(&chosen->c_not_empty);
-            pthread_mutex_unlock(&chosen->c_mtx);
-            
-            // CHANGED: Update both total and priority-specific load
+            // CHANGED: Update both total and priority-specific load (under c_mtx)
             chosen->load_ms += m.est_ms;
             chosen->load_by_prio[m.priority] += m.est_ms;
+            long long ld = chosen->load_ms, lp0 = chosen->load_by_prio[0],
+                      lp1 = chosen->load_by_prio[1], lp2 = chosen->load_by_prio[2];
+            pthread_cond_signal(&chosen->c_not_empty);
+            pthread_mutex_unlock(&chosen->c_mtx);
 
             printf("[Dispatcher topic=%s] assigned msg=%d -> consumer %s (load=%lld, prio_load=[%lld,%lld,%lld])\n",
-                   topic->name, m.id, chosen->name, chosen->load_ms,
-                   chosen->load_by_prio[0], chosen->load_by_prio[1], chosen->load_by_prio[2]);
+                   topic->name, m.id, chosen->name, ld, lp0, lp1, lp2);
                    
         } else {
             // Fanout: push to ALL subscribers
@@ -581,10 +582,7 @@ static void *dispatcher_thread(void *arg){
                 Consumer *c = subs[i];
                 
                 // CHANGED: Priority-aware load for fanout deadline checking
-                long long relevant_load = 0;
-                for (int p = 0; p <= m.priority; p++) {
-                    relevant_load += c->load_by_prio[p];
-                }
+                long long relevant_load = consumer_relevant_load(c, m.priority);
                 long long predicted_finish = now + relevant_load + m.est_ms;
                 
                 if (m.deadline_ms > 0 && predicted_finish > m.deadline_ms){
@@ -604,14 +602,14 @@ static void *dispatcher_thread(void *arg){
                 if (atomic_load(&b->stop)) { pthread_mutex_unlock(&c->c_mtx); break; }
                 
                 q_push_back_nolock(&c->personal_q, m);
+                c->load_ms += m.est_ms;
+                c->load_by_prio[m.priority] += m.est_ms;
+                long long ld = c->load_ms;
                 pthread_cond_signal(&c->c_not_empty);
                 pthread_mutex_unlock(&c->c_mtx);
 
-                c->load_ms += m.est_ms;
-                c->load_by_prio[m.priority] += m.est_ms;
-                
                 printf("[Dispatcher topic=%s] fanout msg=%d -> consumer %s (load=%lld)\n",
-                       topic->name, m.id, c->name, c->load_ms);
+                       topic->name, m.id, c->name, ld);
             }
         }
     }
@@ -682,11 +680,12 @@ static void *dashboard_thread(void *arg){
             int cqsize = 0;
             pthread_mutex_lock(&c->c_mtx);
             cqsize = c->personal_q.total_size;
+            long long ld = c->load_ms, lp0 = c->load_by_prio[0],
+                      lp1 = c->load_by_prio[1], lp2 = c->load_by_prio[2];
             pthread_mutex_unlock(&c->c_mtx);
 
             printf("Consumer[%d] %s: qsize=%d load=%lld prio_load=[%lld,%lld,%lld] done=%ld topics=",
-                   i, c->name, cqsize, c->load_ms, 
-                   c->load_by_prio[0], c->load_by_prio[1], c->load_by_prio[2],
+                   i, c->name, cqsize, ld, lp0, lp1, lp2,
                    atomic_load(&c->done_count));
             for (int j=0;j<c->topic_count;j++){
                 printf("%s ", c->topics[j]->name);
