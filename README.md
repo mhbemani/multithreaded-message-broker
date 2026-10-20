@@ -1,5 +1,7 @@
 # multithreaded-message-broker
 
+[![CI](https://github.com/mhbemani/multithreaded-message-broker/actions/workflows/ci.yml/badge.svg)](https://github.com/mhbemani/multithreaded-message-broker/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 A priority-based publish/subscribe message broker written in C11 with POSIX threads. Producers publish messages to topics, a dispatcher per topic routes them to consumers, and the whole thing runs as a self-contained simulation that prints what every thread is doing. Built as an operating-systems course project on synchronization.
 
 ## How it works
