@@ -1,0 +1,21 @@
+name: CI
+on: [push, pull_request]
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build with warnings enabled
+        run: gcc -std=c11 -O2 -pthread -Wall -Wextra -o broker multithreaded_message_broker.c
+      - name: Default configuration
+        run: ./broker --seconds=3
+      - name: Bounded queues
+        run: ./broker --seconds=3 --producers=4 --consumers=4 --topics=2 --bounded --capacity=2
+      - name: Fanout with retention (TTL and GC)
+        run: ./broker --seconds=3 --producers=4 --consumers=4 --topics=2 --fanout --retention --ttl=300 --gc-interval=100
+      - name: ThreadSanitizer (no data races allowed)
+        run: |
+          sudo sysctl vm.mmap_rnd_bits=28
+          clang -std=c11 -g -O1 -fsanitize=thread -pthread -o broker_tsan multithreaded_message_broker.c
+          ./broker_tsan --seconds=3 > /dev/null 2> tsan.log || true
+          if grep -q "WARNING: ThreadSanitizer" tsan.log; then cat tsan.log; exit 1; fi
